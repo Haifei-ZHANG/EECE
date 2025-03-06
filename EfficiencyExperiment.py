@@ -82,7 +82,7 @@ if __name__ == "__main__":
                         'data types':['float']*len(feature_names)}
         dist_type = 'L2'
         X = np.array(data.iloc[:,:-1])
-        y = np.array(data.iloc[:,-1]) 
+        y = np.array(data.iloc[:,-1]).astype(int)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=True)
         
         for t in range(len(n_depths)):
