@@ -8,10 +8,8 @@ Created on Mon Jan  8 15:25:32 2024
 import numpy as np
 import time
 import copy
+from tqdm import tqdm
 from sklearn.neighbors import LocalOutlierFactor
-import multiprocessing
-from joblib import Parallel, delayed
-
 
 class CFGenerators:
     def __init__(self, rf, train_set, feature_names, feature_cons=None, dist_type='L1'):
@@ -26,95 +24,75 @@ class CFGenerators:
         self.increasing_features = feature_cons['increasing']
         self.decreasing_features = feature_cons['decreasing']
         self.feature_types = feature_cons['data types']
+        self.dist_type = dist_type
         self.epsilon = 0.001
-        self.lof = LocalOutlierFactor(novelty=True)
-        # print(self.feature_names, self.immutable_features , self.increasing_features,self.decreasing_features)
+        self.lof = LocalOutlierFactor(n_neighbors=5, novelty=True)
         
-
-    @staticmethod
-    def _process_tree(tree, n_features):
-        """Parallel processing of individual trees"""
-        decision_paths_dict_part = {}
-        decision_paths_part = []
-        n_nodes = tree.tree_.node_count
-        children_left = tree.tree_.children_left
-        children_right = tree.tree_.children_right
-        feature = tree.tree_.feature
-        threshold = tree.tree_.threshold
-        
-        dp_stack = [[[-1e8, 1e8] for _ in range(n_features)]]
-
-        for i in range(n_nodes):
-            if children_left[i] != children_right[i]:  # Internal node
-                parent_dp = dp_stack.pop()
-                left_dp = copy.deepcopy(parent_dp)
-                right_dp = copy.deepcopy(parent_dp)
-                dp_stack.append(right_dp)
-                dp_stack.append(left_dp)
-                dp_stack[-1][feature[i]][1] = threshold[i]
-                dp_stack[-2][feature[i]][0] = threshold[i]
-            else:  # Leaf node
-                dp_to_add = np.array(dp_stack.pop()).flatten()
-                decision_paths_dict_part[i] = dp_to_add
-                decision_paths_part.append(dp_to_add)
-        
-        return decision_paths_dict_part, decision_paths_part
-
-    @staticmethod
-    def _process_leaf(args):
-        """Parallel processing of leaf regions"""
-        i, leaves_index, decision_paths_dict, n_trees, n_features = args
-        current_live_region = np.zeros((n_trees, 2 * n_features))
-        for t in range(n_trees):
-            current_live_region[t] = decision_paths_dict[t][leaves_index[i, t]]
-        
-        live_region = np.zeros(2 * n_features)
-        live_region[0::2] = current_live_region[:, 0::2].max(axis=0)
-        live_region[1::2] = current_live_region[:, 1::2].min(axis=0)
-        return live_region
-
+    
     def fit(self):
-        # Get feature importance
+        # get feature importance to determin feature order
         feature_importance = self.rf.feature_importances_
         self.feature_order = np.argsort(feature_importance)
         
-        # Distance adjustments
+        # calculate the distance adjustment terms
         self.dist_std = np.std(self.train_set, axis=0)
         medians_abs_diff = abs(self.train_set - np.median(self.train_set, axis=0))
         self.dist_mad = np.mean(medians_abs_diff, axis=0)
-        self.dist_mad[self.dist_mad == 0] = 1
+        self.dist_mad[self.dist_mad==0] = 1
         
-        # Train LOF
+        # train the local outlier factor
         self.lof.fit(self.train_set)
         
-        # Parallel tree processing
-        print('Building candidate regions with parallel processing')
-        with Pool(processes=multiprocessing.cpu_count()) as pool:
-            results = pool.starmap(self._process_tree, 
-                                 [(tree, self.n_features) for tree in self.rf.estimators_])
-        
-        # Aggregate tree results
-        self.decision_paths_dict = {}
+        # extract decision paths
         decision_paths = np.zeros(2 * self.n_features)
-        for t, (dict_part, paths_part) in enumerate(results):
-            self.decision_paths_dict[t] = dict_part
-            if paths_part:
-                decision_paths = np.vstack((decision_paths, np.array(paths_part)))
+        decision_paths_dict = {}
+        t = -1
+        print('Building candidate regions')
+        for tree in tqdm(self.rf.estimators_):
+            t += 1
+            decision_paths_dict[t] = {}
+            n_nodes = tree.tree_.node_count
+            children_left = tree.tree_.children_left
+            children_right = tree.tree_.children_right
+            feature = tree.tree_.feature
+            threshold = tree.tree_.threshold
+            
+            dp_stack = [[[-1e8, 1e8] for i in range(self.n_features)]]
+    
+            for i in range(n_nodes):
+                is_internal_node = (children_left[i] != children_right[i])
+                if is_internal_node:
+                    parent_dp = dp_stack.pop()
+                    left_dp = copy.deepcopy(parent_dp)
+                    right_dp = copy.deepcopy(parent_dp)
+                    dp_stack.append(right_dp)
+                    dp_stack.append(left_dp)
+                    dp_stack[-1][feature[i]][1] = threshold[i]
+                    dp_stack[-2][feature[i]][0] = threshold[i]
+                else:
+                    dp_to_add = np.array(dp_stack.pop()).flatten()
+                    decision_paths_dict[t][i] = dp_to_add
+                    decision_paths = np.vstack((decision_paths, dp_to_add))
+            
         self.decision_paths = decision_paths[1:,:]
-
-        # Process leaves in parallel
+        
         leaves_index = self.rf.apply(self.train_set)
         leaves_index, remain_index = np.unique(leaves_index, axis=0, return_index=True)
-        self.live_regions_predictions = self.rf.predict(self.train_set)[remain_index]
+        self.live_regions_predictions = (self.rf.predict(self.train_set))[remain_index]
         self.leaves_index = leaves_index
-        
-        print('Building live regions with parallel processing')
-        with Pool(processes=min(4, multiprocessing.cpu_count())) as pool:
-            args = [(i, leaves_index, self.decision_paths_dict, 
-                    self.n_trees, self.n_features) for i in range(len(leaves_index))]
-            self.live_regions = np.array(pool.map(self._process_leaf, args))
-            
+        self.live_regions = np.zeros((len(leaves_index), 2 * self.n_features))
+        # construct live regions
+        for i in range(len(leaves_index)):
+            current_live_region = np.zeros((self.n_trees, 2 * self.n_features))
+            for t in range(self.n_trees):
+                current_live_region[t] = decision_paths_dict[t][leaves_index[i,t]]
     
+            self.live_regions[i,0:-1:2] = current_live_region[:,0:-1:2].max(axis=0)
+            self.live_regions[i,1::2] = current_live_region[:,1::2].min(axis=0)
+    
+        # self.epsilon = ((self.live_regions[:,1::2]-self.live_regions[:,0:-1:2])/2).min()
+        # print(self.epsilon)
+     
         
     def __instance_dist(self, x, X, dist_type):
         if dist_type == 'L1':
@@ -183,31 +161,32 @@ class CFGenerators:
                     index = (x[d] == remain_instances[:,d])
                     remain_instances = remain_instances[index]
                     continue
-            if self.increasing_features is not None:
+            elif self.increasing_features is not None:
                 if feature in self.increasing_features:
                     index = (x[d] <= remain_instances[:,d])
                     remain_instances = remain_instances[index]
                     continue
-            if self.decreasing_features is not None:
+            elif self.decreasing_features is not None:
                 if feature in self.decreasing_features:
                     index = (x[d] >= remain_instances[:,d])
                     remain_instances = remain_instances[index]
                     continue
+            else:
+                continue
             
         if len(remain_instances) == 0:
             print("Your feature constrains are too strict for this instance! Can't generate satisfied counterfactual example!")
             return None, None
         dists = self.__instance_dist(x, remain_instances, dist_type)
-        
         cf_index = np.argmin(dists)
         min_dist = dists[cf_index]
         cf = remain_instances[cf_index]
+        
         return cf, round(min_dist,4)
-
     
     
-    def discern(self, x, target, dist_type=None, k=1):
-        init_cf, init_min_dist = self.mo(x, target, dist_type, k)
+    def discern(self, x, target, dist_type=None):
+        init_cf, init_min_dist = self.mo(x, target, dist_type)
         cf = x.copy()
         if init_cf is None:
             return init_cf, init_min_dist
@@ -220,7 +199,7 @@ class CFGenerators:
                     return cf, round(min_dist, 4)
             
     
-    def lire(self, x, target, dist_type=None, k=1):
+    def lire(self, x, target, dist_type=None):
         live_regions = self.live_regions[self.live_regions_predictions==target].copy()
         for d in range(self.n_features):
             feature = self.feature_names[d]
@@ -230,16 +209,18 @@ class CFGenerators:
                     index = (live_regions[:,2*d] < x[d]) * (x[d] <= live_regions[:,2*d+1])
                     live_regions = live_regions[index]
                     continue
-            if self.increasing_features is not None:
+            elif self.increasing_features is not None:
                 if feature in self.increasing_features:
                     index = live_regions[:,2*d+1] > x[d]
                     live_regions = live_regions[index]
                     continue
-            if self.decreasing_features is not None:
+            elif self.decreasing_features is not None:
                 if feature in self.decreasing_features:
                     index = live_regions[:,2*d] < x[d]
                     live_regions = live_regions[index]
                     continue
+            else:
+                continue
         
         if len(live_regions)==0:
             print("Your feature constrains are too strict for this instance! Can't generate satisfied counterfactual example!")
@@ -252,115 +233,56 @@ class CFGenerators:
             cf_index = np.argmin(dists)
             min_dist = dists[cf_index]
             cf = candidates[cf_index]
-            
-            if len(candidates) == 0:
-                return cf, min_dist
-            cf_index = np.argmin(dists)
-            min_dist = dists[cf_index]
-            cf = candidates[cf_index]
-            
-            return cf, round(min_dist, 4)
+        
+            return cf, round(min_dist,4)
         
     
-    def eece(self, x, target, dist_type=None, k=1):
-        cf, min_dist = self.lire(x, target, dist_type)
-        
-        candidates = self.__generate_cf_in_regions(x, self.decision_paths)
-        dists = self.__instance_dist(x, candidates, dist_type)
-
-        
-        index = dists < min_dist
-        candidates = candidates[index]
-        dists = dists[index]
-        
-        if len(candidates) == 0:
-            return cf, min_dist
-        
-        # Optimize random forest predictions - this is the computationally intensive part
-        # Many random forest implementations already support internal parallelism
-        n_jobs = multiprocessing.cpu_count()
-        
-        # If random forests support parallelism, use directly
-        if hasattr(self.rf, 'n_jobs'):
-            old_n_jobs = self.rf.n_jobs
-            self.rf.n_jobs = n_jobs
-            predictions = self.rf.predict(candidates)
-            self.rf.n_jobs = old_n_jobs
-        else:
-            # Otherwise manually parallelized high-volume forecasts
-            batch_size = max(1, len(candidates) // n_jobs)
+    
+    def eece(self, x, target, dist_type=None):     
+        regions = np.concatenate((self.decision_paths.copy(), self.live_regions[self.live_regions_predictions==target].copy()), axis=0)
+        for d in range(self.n_features):
+            feature = self.feature_names[d]
             
-            def predict_batch(batch):
-                return self.rf.predict(batch)
-                
-            # Parallel processing only when sample size is large enough
-            if len(candidates) > 1000:  # can be adjusted
-                batches = [candidates[i:i+batch_size] for i in range(0, len(candidates), batch_size)]
-                batch_results = Parallel(n_jobs=n_jobs)(
-                    delayed(predict_batch)(batch) for batch in batches
-                )
-                predictions = np.concatenate(batch_results)
+            if self.immutable_features is not None:
+                if feature in self.immutable_features:
+                    index = (regions[:,2*d] < x[d]) * (x[d] <= regions[:,2*d+1])
+                    regions = regions[index]
+                    continue
+            elif self.increasing_features is not None:
+                if feature in self.increasing_features:
+                    index = regions[:,2*d+1] > x[d]
+                    regions = regions[index]
+                    continue
+            elif self.decreasing_features is not None:
+                if feature in self.decreasing_features:
+                    index = regions[:,2*d] < x[d]
+                    regions = regions[index]
+                    continue
             else:
-                predictions = self.rf.predict(candidates)
+                continue
         
-        index = predictions == target
-        candidates = candidates[index]
-        dists = dists[index]
-        
-        if len(candidates) == 0:
-            return cf, min_dist
-        
-        # Optimize LOF calculations - often also computationally intensive
-        if hasattr(self.lof, 'n_jobs'):
-            # Use built-in parallelism
-            old_n_jobs = self.lof.n_jobs
-            self.lof.n_jobs = n_jobs
-            plausibility = self.lof.predict(candidates)
-            self.lof.n_jobs = old_n_jobs
+        if len(regions)==0:
+            print("1 Your feature constrains are too strict for this instance! Can't generate satisfied counterfactual example!")
+            return None, None
         else:
-            # Manual batch parallel processing
-            # Parallelize only when sample size is large enough
-            if len(candidates) > 500:  # can be adjusted
-                batch_size = max(1, len(candidates) // n_jobs)
-                batches = [candidates[i:i+batch_size] for i in range(0, len(candidates), batch_size)]
-                
-                def lof_predict_batch(batch):
-                    return self.lof.predict(batch)
-                    
-                batch_results = Parallel(n_jobs=n_jobs)(
-                    delayed(lof_predict_batch)(batch) for batch in batches
-                )
-                plausibility = np.concatenate(batch_results)
+            candidates = self.__generate_cf_in_regions(x, regions)
+            predictions = self.rf.predict(candidates)
+            candidates = candidates[predictions==target]
+            if len(candidates)==0:
+                print("2 Can not generate counterfactual example!")
+                return None, None
             else:
                 plausibility = self.lof.predict(candidates)
-        
-        index = (plausibility == 1)
-        candidates = candidates[index]
-        dists = dists[index]
-        
-        if k>1:
-            view = np.ascontiguousarray(candidates).view(np.dtype((np.void, candidates.dtype.itemsize * candidates.shape[1])))
-            _, index = np.unique(view, return_index=True)
-            candidates = candidates[index]
-            dists = dists[index]
+                if sum(plausibility)!=0:
+                    candidates = candidates[plausibility==1]
+                dists = self.__instance_dist(x, candidates, dist_type)
+                cf_index = np.argmin(dists)
+                min_dist = dists[cf_index]
+                cf = candidates[cf_index]
+                
+                return cf, round(min_dist,4)
             
-            order = np.argsort(dists)
-            cfs_index = order[:min(len(order), k)]
-            cfs = candidates[cfs_index]
-            min_dists = dists[cfs_index]
-            # print(cfs, min_dists)
-            return cfs, min_dists
-        else:
-            if len(candidates) == 0:
-                return cf, min_dist
-            cf_index = np.argmin(dists)
-            min_dist = dists[cf_index]
-            cf = candidates[cf_index]
             
-            return cf, round(min_dist, 4)
-
-        
-    
     def generate_cf(self, x, target, generator='eece', dist_type=None):
         y_hat = self.rf.predict(x.reshape((1,-1)))[0]
         if target not in self.classes or target==y_hat:
@@ -407,3 +329,21 @@ class CFGenerators:
             
             return result
             
+            
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
