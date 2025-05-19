@@ -10,6 +10,7 @@ import time
 import copy
 from sklearn.neighbors import LocalOutlierFactor
 import multiprocessing
+from multiprocessing import Pool
 from joblib import Parallel, delayed
 
 
@@ -206,8 +207,8 @@ class CFGenerators:
 
     
     
-    def discern(self, x, target, dist_type=None, k=1):
-        init_cf, init_min_dist = self.mo(x, target, dist_type, k)
+    def discern(self, x, target, dist_type=None):
+        init_cf, init_min_dist = self.mo(x, target, dist_type)
         cf = x.copy()
         if init_cf is None:
             return init_cf, init_min_dist
@@ -220,7 +221,7 @@ class CFGenerators:
                     return cf, round(min_dist, 4)
             
     
-    def lire(self, x, target, dist_type=None, k=1):
+    def lire(self, x, target, dist_type=None):
         live_regions = self.live_regions[self.live_regions_predictions==target].copy()
         for d in range(self.n_features):
             feature = self.feature_names[d]
@@ -262,7 +263,7 @@ class CFGenerators:
             return cf, round(min_dist, 4)
         
     
-    def eece(self, x, target, dist_type=None, k=1):
+    def eece(self, x, target, dist_type=None):
         cf, min_dist = self.lire(x, target, dist_type)
         
         candidates = self.__generate_cf_in_regions(x, self.decision_paths)
@@ -338,26 +339,13 @@ class CFGenerators:
         candidates = candidates[index]
         dists = dists[index]
         
-        if k>1:
-            view = np.ascontiguousarray(candidates).view(np.dtype((np.void, candidates.dtype.itemsize * candidates.shape[1])))
-            _, index = np.unique(view, return_index=True)
-            candidates = candidates[index]
-            dists = dists[index]
-            
-            order = np.argsort(dists)
-            cfs_index = order[:min(len(order), k)]
-            cfs = candidates[cfs_index]
-            min_dists = dists[cfs_index]
-            # print(cfs, min_dists)
-            return cfs, min_dists
-        else:
-            if len(candidates) == 0:
-                return cf, min_dist
-            cf_index = np.argmin(dists)
-            min_dist = dists[cf_index]
-            cf = candidates[cf_index]
-            
-            return cf, round(min_dist, 4)
+        if len(candidates) == 0:
+            return cf, min_dist
+        cf_index = np.argmin(dists)
+        min_dist = dists[cf_index]
+        cf = candidates[cf_index]
+        
+        return cf, round(min_dist, 4)
 
         
     
